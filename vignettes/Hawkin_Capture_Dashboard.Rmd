@@ -1,0 +1,206 @@
+---
+title: "Designing a Hawkin Capture-Style Performance Dashboard"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Designing a Hawkin Capture-Style Performance Dashboard}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+dependencies:
+  - knitr
+  - shiny
+  - bslib
+  - plotly
+  - dplyr
+  - tidyr
+  - reactable
+  - shiny.i18n
+  - lubridate
+  - purrr
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+## Purpose
+
+World-class athletes and sport scientists need a unified place to review, interpret, and act on Hawkin Dynamics force-plate data. This vignette sketches a Shiny dashboard that emulates **Hawkin Capture** while adding:
+
+- **Full data coverage:** force-time curves, jump summaries, readiness flags, and wellness context.
+- **Visual clarity:** interactive charts, session timelines, and positional benchmarks.
+- **Automations:** scheduled pulls from `hawkinR`, proactive alerts, multilingual UI, and role-aware views.
+
+The goal is to provide a production-ready blueprint you can adapt to your organization's infrastructure.
+
+## Data pipeline
+
+A repeatable pipeline keeps the dashboard fresh and trustworthy:
+
+1. **Authentication:** request an access token with `get_access()` and store it in a secure key store (for example, environment variables or an encrypted file created via [Store_API_Key_Locally](Store_API_Key_Locally.html)).
+2. **Ingestion cadence:** run a scheduled job (cron, `taskscheduleR`, GitHub Actions, or Posit Connect) that fetches new data every few minutes while also running a full historical sync daily.
+3. **Data model:** persist tests, athletes, and derived metrics in a relational store (Postgres/SQLite) or Parquet files. Use stable IDs (`testId`, `athleteId`, `testTypeId`) for joins and change tracking.
+4. **Derived features:** compute jump strategy indicators (RSI, peak power, asymmetry), freshness scores, and individualized z-scores against rolling windows.
+5. **Validation:** log ingestion summaries (rows inserted/updated, error rate) and surface them in an admin panel so staff can spot issues early.
+
+### Run it directly
+
+You can execute a minimal end-to-end pull without wiring up your own scheduler. The repo ships with a runner that caches tests and a subset of force-time curves, then optionally launches a Shiny preview:
+
+```r
+source(system.file("extdata", "hawkin_capture_runner.R", package = "hawkinR"))
+cache <- hawkin_capture_pipeline(days = 7, max_forcetime = 15)
+preview_hawkin_capture(cache) # requires shiny + plotly
+```
+
+The script reads `HAWKIN_REFRESH_TOKEN`, `HAWKIN_REGION` (default `Americas`), and optional `HAWKIN_ORG_NAME` environment variables before calling `get_access()`, `get_tests()`, and `get_forcetime()`. Output is saved in `hawkin_capture_cache/` to keep downstream rendering fast.
+
+### Example ingestion script (scheduled)
+
+```{r ingest, eval = FALSE}
+library(hawkinR)
+library(dplyr)
+library(lubridate)
+library(DBI)
+library(duckdb)
+
+con <- dbConnect(duckdb::duckdb(), "hawkin.duckdb")
+
+get_access(
+  refreshToken = Sys.getenv("HD_REFRESH"),
+  region = Sys.getenv("HD_REGION")
+)
+
+from_ts <- floor_date(Sys.time() - minutes(15), unit = "minute")
+to_ts   <- Sys.time()
+
+recent_tests <- get_tests(from = from_ts, to = to_ts)
+force_traces <- purrr::map_dfr(recent_tests$testId, get_forcetime, .id = "testId")
+
+# Example: compute quick readiness score (simple placeholder)
+recent_tests <- recent_tests |>
+  mutate(
+    peak_power_rel = peakPower / bodyWeight,
+    rsi_mod = jumpHeight / timeToTakeoff,
+    readiness_score = scales::rescale(peak_power_rel + rsi_mod, to = c(0, 100))
+  )
+
+# Persist
+if (!dbExistsTable(con, "tests")) dbWriteTable(con, "tests", recent_tests)
+else dbAppendTable(con, "tests", recent_tests)
+
+if (!dbExistsTable(con, "force")) dbWriteTable(con, "force", force_traces)
+else dbAppendTable(con, "force", force_traces)
+
+invisible(dbDisconnect(con, shutdown = TRUE))
+```
+
+## UI/UX blueprint
+
+The following layout uses `bslib` for modern theming and `shiny.i18n` for multilingual copy (you can import translations from Hawkin language packs to support staff and athletes worldwide).
+
+- **Global shell:** navigation bar with athlete search, date range, and language selector.
+- **Hero tiles:** readiness score, asymmetry alert, session count, and peak power trend with sparkline.
+- **Main panels:**
+  - **Readiness overview:** percentile rings, individualized z-scores, and fatigue flags.
+  - **Force-time explorer:** interactive overlay of trials (Plotly), with toggles for normalized vs. absolute curves.
+  - **Jump summary table:** sortable Reactable with conditional formatting for performance tiers.
+  - **Wellness context:** questionnaire scores and acute:chronic workload ratio overlays.
+  - **Coach notes:** rich text area that writes back to your performance database.
+- **Automation cues:** banners for ingestion health and a download button for CSV/Parquet exports.
+
+### Minimal Shiny scaffold
+
+```{r shiny-skeleton, eval = FALSE}
+library(shiny)
+library(bslib)
+library(plotly)
+library(reactable)
+library(dplyr)
+library(tidyr)
+library(shiny.i18n)
+
+# Load translations exported from the Hawkin language pack
+translator <- Translator$new(translation_json_path = "inst/i18n/translations.json")
+translator$set_translation_language("en")
+
+theme <- bs_theme(bootswatch = "cosmo", primary = "#1E88E5", secondary = "#43A047")
+
+dashboard_ui <- page_navbar(
+  title = "Hawkin Capture+",
+  theme = theme,
+  nav_spacer(),
+  input_switch("language", translator$t("Language"), value = TRUE,
+               on_label = "EN", off_label = "ES"),
+  input_date_range("date", translator$t("Date range")),
+  nav_panel(
+    translator$t("Overview"),
+    layout_columns(
+      col_widths = c(3, 3, 3, 3),
+      value_box(translator$t("Readiness"), textOutput("readiness")),
+      value_box(translator$t("Asymmetry"), textOutput("asym")),
+      value_box(translator$t("Sessions"), textOutput("sessions")),
+      value_box(translator$t("Peak Power"), plotOutput("pp_spark"))
+    ),
+    card(
+      full_screen = TRUE,
+      card_header(translator$t("Force-Time Explorer")),
+      plotlyOutput("force_plot"),
+      sliderInput("smooth", translator$t("Smoothing (ms)"), 0, 25, 5, step = 5)
+    ),
+    card(
+      card_header(translator$t("Jump Summary")),
+      reactableOutput("jump_table")
+    )
+  ),
+  nav_panel(
+    translator$t("Wellness & Notes"),
+    layout_columns(
+      card(plotlyOutput("wellness")),
+      card(textAreaInput("notes", translator$t("Coach notes"), width = "100%"))
+    )
+  )
+)
+
+server <- function(input, output, session) {
+  observeEvent(input$language, translator$set_translation_language(ifelse(input$language, "en", "es")))
+
+  # Replace with data from your ingestion store
+  tests <- reactive({ dplyr::tibble(athlete = "A. Smith", jumpHeight = 0.45, asym = 4.2) })
+
+  output$jump_table <- renderReactable({
+    reactable(tests(), columns = list(
+      jumpHeight = colDef(name = translator$t("Jump Height (m)"), format = colFormat(digits = 2)),
+      asym = colDef(name = translator$t("Asymmetry (%)"), format = colFormat(digits = 1),
+                    style = function(value) ifelse(value > 10, list(color = "#E53935"), NULL))
+    ))
+  })
+}
+
+shinyApp(dashboard_ui, server)
+```
+
+## Analytics and interpretation
+
+- **Force-time:** highlight impulse-to-100 ms, concentric peak power, and net braking/loading symmetry.
+- **Jump strategy:** plot time-to-takeoff vs. jump height to classify strategies (dip, stretch-shortening, squat jump drift).
+- **Fatigue/readiness:** rolling z-scores (7–21 days) for RSI-mod and peak power; flag green/amber/red bands.
+- **Return-to-play:** asymmetry thresholds by limb and task (CMJ, ISO-MID, isometric calf); include smallest worthwhile change bands.
+- **Comparative lenses:** team, position group, and individual overlays; automatically pick priors based on athlete profile.
+
+## Automation and alerting
+
+- **Proactive notifications:** email/Slack/Teams when readiness drops \>1 SD from baseline or when asymmetry \>10% for two consecutive sessions.
+- **Data quality:** send alerts if ingestion latency \> 10 minutes or if incoming tests fall below expected volume for the day.
+- **Export jobs:** nightly Parquet/CSV packages with metadata so coaches can conduct offline analysis.
+
+## Operational checklist
+
+- Version control the Shiny code and the translation JSON used by `shiny.i18n`.
+- Containerize the app (Rocker + system libraries) and deploy on Posit Connect, Shiny Server, or Kubernetes behind SSO.
+- Log performance: chart render times, API call durations, and cache hit rates to keep the UI under 1.5 seconds for primary views.
+- Add accessibility: ARIA labels on controls, high-contrast theme toggle, and keyboard navigation for athletes with visual strain.
+
+By combining `hawkinR` ingestion with this dashboard scaffold, practitioners can interact with Hawkin Dynamics data at the speed required for elite performance, while multilingual support keeps the experience consistent across global staffs.
