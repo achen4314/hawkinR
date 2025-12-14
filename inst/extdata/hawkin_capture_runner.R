@@ -27,6 +27,76 @@ hawkin_capture_pipeline <- function(days = 7,
     stop("hawkinR must be installed to run the capture pipeline.")
   }
 
+  tz <- if (is.na(tz) || !nzchar(tz)) "UTC" else tz
+  env <- .validate_hawkin_env()
+
+  access <- hawkinR::get_access(
+    refreshToken = env$refresh_token,
+    region = env$region,
+    org_name = if (nzchar(env$org_name)) env$org_name else NULL
+  )
+
+  now <- as.numeric(Sys.time())
+  window_start <- now - days * 24 * 60 * 60
+
+  message(
+    "Fetching tests from the last ", days, " days (region: ", env$region,
+    if (nzchar(env$org_name)) paste0(", org: ", env$org_name) else "",
+    ")..."
+  )
+  tests <- hawkinR::get_tests(from = window_start, to = now)
+
+  if (is.null(tests) || nrow(tests) == 0) {
+    warning("No tests returned for the requested window; nothing cached.")
+    return(list(
+      access = access,
+      tests = tests,
+      forcetime = list(),
+      tz = tz,
+      output_dir = normalizePath(output_dir)
+    ))
+  }
+
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+  }
+
+  tests$startTime <- as.POSIXct(tests$startTime, origin = "1970-01-01", tz = tz)
+  saveRDS(tests, file.path(output_dir, "tests.rds"))
+  message("Saved ", nrow(tests), " tests to ", file.path(output_dir, "tests.rds"))
+
+  forcetime_ids <- head(tests$id, max_forcetime)
+  if (length(forcetime_ids) == 0) {
+    warning("No force-time IDs available to download.")
+    force_curves <- list()
+  } else {
+    force_curves <- lapply(forcetime_ids, function(id) {
+      message("Downloading force-time for test ", id, "...")
+      tryCatch(
+        hawkinR::get_forcetime(testId = id),
+        error = function(e) {
+          warning(sprintf("Force-time download failed for %s: %s", id, e$message))
+          NULL
+        }
+      )
+    })
+    names(force_curves) <- forcetime_ids
+  }
+
+  saveRDS(force_curves, file.path(output_dir, "forcetime.rds"))
+  message("Saved ", length(Filter(Negate(is.null), force_curves)), " force-time traces to ",
+          " ", file.path(output_dir, "forcetime.rds"))
+
+  list(
+    access = access,
+    tests = tests,
+    forcetime = force_curves,
+    tz = tz,
+    output_dir = normalizePath(output_dir)
+  )
+}
+
+.validate_hawkin_env <- function() {
   refresh_token <- Sys.getenv("HAWKIN_REFRESH_TOKEN")
   region <- Sys.getenv("HAWKIN_REGION", unset = "Americas")
   org_name <- Sys.getenv("HAWKIN_ORG_NAME", unset = "")
@@ -35,42 +105,19 @@ hawkin_capture_pipeline <- function(days = 7,
     stop("Set HAWKIN_REFRESH_TOKEN in your environment before running.")
   }
 
-  access <- hawkinR::get_access(
-    refreshToken = refresh_token,
-    region = region,
-    org_name = if (nzchar(org_name)) org_name else NULL
-  )
-
-  now <- as.numeric(Sys.time())
-  window_start <- now - days * 24 * 60 * 60
-
-  message("Fetching tests from the last ", days, " days (region: ", region, ")...")
-  tests <- hawkinR::get_tests(from = window_start, to = now)
-
-  if (!dir.exists(output_dir)) {
-    dir.create(output_dir, recursive = TRUE)
+  valid_regions <- c("Americas", "Europe", "Asia/Pacific", "Dev")
+  if (!region %in% valid_regions) {
+    warning(
+      "HAWKIN_REGION not recognized (", region, "); defaulting to 'Americas'.",
+      " Valid options: ", paste(valid_regions, collapse = ", ")
+    )
+    region <- "Americas"
   }
 
-  saveRDS(tests, file.path(output_dir, "tests.rds"))
-  message("Saved ", nrow(tests), " tests to ", file.path(output_dir, "tests.rds"))
-
-  # Pull force-time traces for a subset to control runtime
-  forcetime_ids <- head(tests$id, max_forcetime)
-  force_curves <- lapply(forcetime_ids, function(id) {
-    message("Downloading force-time for test ", id, "...")
-    hawkinR::get_forcetime(testId = id)
-  })
-  names(force_curves) <- forcetime_ids
-
-  saveRDS(force_curves, file.path(output_dir, "forcetime.rds"))
-  message("Saved ", length(force_curves), " force-time traces to ", file.path(output_dir, "forcetime.rds"))
-
   list(
-    access = access,
-    tests = tests,
-    forcetime = force_curves,
-    tz = tz,
-    output_dir = normalizePath(output_dir)
+    refresh_token = refresh_token,
+    region = region,
+    org_name = org_name
   )
 }
 

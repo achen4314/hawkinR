@@ -47,7 +47,7 @@ A repeatable pipeline keeps the dashboard fresh and trustworthy:
 
 ### Run it directly
 
-You can execute a minimal end-to-end pull without wiring up your own scheduler. The repo ships with a runner that caches tests and a subset of force-time curves, then optionally launches a Shiny preview:
+You can execute a minimal end-to-end pull without wiring up your own scheduler. The repo ships with a runner that caches tests and a subset of force-time curves, then optionally launches a Shiny preview. It validates the Hawkin environment variables up front, defaults to `UTC` when no system timezone is available, and gracefully skips force-time downloads that fail so one bad request does not halt the job:
 
 ```r
 source(system.file("extdata", "hawkin_capture_runner.R", package = "hawkinR"))
@@ -55,7 +55,7 @@ cache <- hawkin_capture_pipeline(days = 7, max_forcetime = 15)
 preview_hawkin_capture(cache) # requires shiny + plotly
 ```
 
-The script reads `HAWKIN_REFRESH_TOKEN`, `HAWKIN_REGION` (default `Americas`), and optional `HAWKIN_ORG_NAME` environment variables before calling `get_access()`, `get_tests()`, and `get_forcetime()`. Output is saved in `hawkin_capture_cache/` to keep downstream rendering fast.
+The script reads `HAWKIN_REFRESH_TOKEN`, `HAWKIN_REGION` (default `Americas`), and optional `HAWKIN_ORG_NAME` environment variables before calling `get_access()`, `get_tests()`, and `get_forcetime()`. If no tests are returned for the requested window, it stops early with a warning. Output is saved in `hawkin_capture_cache/` to keep downstream rendering fast.
 
 ### Example ingestion script (scheduled)
 
